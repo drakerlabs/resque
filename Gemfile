@@ -2,18 +2,13 @@ source :rubygems
 
 gemspec
 
-group :development do
-  gem 'rake'
-  gem 'yard'
-end
-
-group :documentation do
-  gem 'rdoc'
-  gem 'kramdown'
-end
-
 group :test do
+  gem "rake"
   gem "rack-test", "~> 0.5"
-  gem "json"
-  gem "minitest"
+  gem "mocha", "~> 0.9.7"
+  gem "yajl-ruby", "~>0.8.2", :platforms => :mri
+  gem "json", "~>1.5.3", :platforms => [:jruby, :rbx]
+  gem "hoptoad_notifier"
+  gem "airbrake"
+  gem "i18n"
 end

@@ -1,4 +1,3 @@
-require 'logger'
 require 'redis/namespace'
 
 require 'resque/version'
@@ -10,14 +9,9 @@ require 'resque/failure/base'
 
 require 'resque/helpers'
 require 'resque/stat'
-require 'resque/logging'
 require 'resque/job'
 require 'resque/worker'
 require 'resque/plugin'
-require 'resque/queue'
-require 'resque/multi_queue'
-require 'resque/coder'
-require 'resque/json_coder'
 
 require 'resque/vendor/utf8_util'
 
@@ -35,7 +29,7 @@ module Resque
   def redis=(server)
     case server
     when String
-      if server['redis://']
+      if server =~ /redis\:\/\//
         redis = Redis.connect(:url => server, :thread_safe => true)
       else
         server, namespace = server.split('/', 2)
@@ -51,23 +45,13 @@ module Resque
     else
       @redis = Redis::Namespace.new(:resque, :redis => server)
     end
-    @queues = Hash.new { |h,name|
-      h[name] = Resque::Queue.new(name, @redis, coder)
-    }
   end
-
-  # Encapsulation of encode/decode. Overwrite this to use it across Resque.
-  # This defaults to JSON for backwards compatibility.
-  def coder
-    @coder ||= JsonCoder.new
-  end
-  attr_writer :coder
 
   # Returns the current Redis connection. If none has been created, will
   # create a new one.
   def redis
     return @redis if @redis
-    self.redis = Redis.respond_to?(:connect) ? Redis.connect(:thread_safe => true) : "localhost:6379"
+    self.redis = Redis.respond_to?(:connect) ? Redis.connect : "localhost:6379"
     self.redis
   end
 
@@ -82,106 +66,46 @@ module Resque
     end
   end
 
-  # Set or retrieve the current logger object
-  attr_accessor :logger
-
   # The `before_first_fork` hook will be run in the **parent** process
   # only once, before forking to run the first job. Be careful- any
   # changes you make will be permanent for the lifespan of the
   # worker.
   #
-  # Call with a block to register a hook.
-  # Call with no arguments to return all registered hooks.
+  # Call with a block to set the hook.
+  # Call with no arguments to return the hook.
   def before_first_fork(&block)
-    block ? register_hook(:before_first_fork, block) : hooks(:before_first_fork)
+    block ? (@before_first_fork = block) : @before_first_fork
   end
 
-  # Register a before_first_fork proc.
-  def before_first_fork=(block)
-    register_hook(:before_first_fork, block)
-  end
+  # Set a proc that will be called in the parent process before the
+  # worker forks for the first time.
+  attr_writer :before_first_fork
 
   # The `before_fork` hook will be run in the **parent** process
   # before every job, so be careful- any changes you make will be
   # permanent for the lifespan of the worker.
   #
-  # Call with a block to register a hook.
-  # Call with no arguments to return all registered hooks.
+  # Call with a block to set the hook.
+  # Call with no arguments to return the hook.
   def before_fork(&block)
-    block ? register_hook(:before_fork, block) : hooks(:before_fork)
+    block ? (@before_fork = block) : @before_fork
   end
 
-  # Register a before_fork proc.
-  def before_fork=(block)
-    register_hook(:before_fork, block)
-  end
+  # Set the before_fork proc.
+  attr_writer :before_fork
 
   # The `after_fork` hook will be run in the child process and is passed
   # the current job. Any changes you make, therefore, will only live as
   # long as the job currently being processed.
   #
-  # Call with a block to register a hook.
-  # Call with no arguments to return all registered hooks.
+  # Call with a block to set the hook.
+  # Call with no arguments to return the hook.
   def after_fork(&block)
-    block ? register_hook(:after_fork, block) : hooks(:after_fork)
+    block ? (@after_fork = block) : @after_fork
   end
 
-  # Register an after_fork proc.
-  def after_fork=(block)
-    register_hook(:after_fork, block)
-  end
-
-  # The `before_pause` hook will be run in the parent process before the
-  # worker has paused processing (via #pause_processing or SIGUSR2).
-  def before_pause(&block)
-    block ? register_hook(:before_pause, block) : hooks(:before_pause)
-  end
-
-  # Register a before_pause proc.
-  def before_pause=(block)
-    register_hook(:before_pause, block)
-  end
-
-  # The `after_pause` hook will be run in the parent process after the
-  # worker has paused (via SIGCONT).
-  def after_pause(&block)
-    block ? register_hook(:after_pause, block) : hooks(:after_pause)
-  end
-
-  # Register an after_pause proc.
-  def after_pause=(block)
-    register_hook(:after_pause, block)
-  end
-
-  # The `before_perform` hook will be run in the child process before
-  # the job code is performed. This hook will run before any
-  # Job.before_perform hook.
-  #
-  # Call with a block to register a hook.
-  # Call with no arguments to return all registered hooks.
-  def before_perform(&block)
-    block ? register_hook(:before_perform, block) : hooks(:before_perform)
-  end
-
-  # Register an before_perform proc.
-  def before_perform=(block)
-    register_hook(:before_perform, block)
-  end
-
-  # The `after_perform` hook will be run in the child process after
-  # the job code has performed. This hook will run after any
-  # Job.after_perform hook.
-  #
-  # Call with a block to register a hook.
-  # Call with no arguments to return all registered hooks.
-  def after_perform(&block)
-    block ? register_hook(:after_perform, block) : hooks(:after_perform)
-  end
-
-  # Register an after_perform proc.
-  def after_perform=(block)
-    register_hook(:after_perform, block)
-  end
+  # Set the after_fork proc.
+  attr_writer :after_fork
 
   def to_s
     "Resque Client connected to #{redis_id}"
@@ -201,7 +125,7 @@ module Resque
   # Pushes a job onto a queue. Queue name should be a string and the
   # item should be any JSON-able Ruby object.
   #
-  # Resque workers generally expect the `item` to be a hash with the following
+  # Resque works generally expect the `item` to be a hash with the following
   # keys:
   #
   #   class - The String name of the job to run.
@@ -210,28 +134,25 @@ module Resque
   #
   # Example
   #
-  #   Resque.push('archive', 'class' => 'Archive', 'args' => [ 35, 'tar' ])
+  #   Resque.push('archive', :class => 'Archive', :args => [ 35, 'tar' ])
   #
   # Returns nothing
   def push(queue, item)
-    queue(queue) << item
+    watch_queue(queue)
+    redis.rpush "queue:#{queue}", encode(item)
   end
 
   # Pops a job off a queue. Queue name should be a string.
   #
   # Returns a Ruby object.
   def pop(queue)
-    begin
-      queue(queue).pop(true)
-    rescue ThreadError
-      nil
-    end
+    decode redis.lpop("queue:#{queue}")
   end
 
   # Returns an integer representing the size of a queue.
   # Queue name should be a string.
   def size(queue)
-    queue(queue).size
+    redis.llen("queue:#{queue}").to_i
   end
 
   # Returns an array of items currently queued. Queue name should be
@@ -240,18 +161,10 @@ module Resque
   # start and count should be integer and can be used for pagination.
   # start is the item to begin, count is how many items to return.
   #
-  # To get the 3rd page of a 30 items, paginated list one would use:
+  # To get the 3rd page of a 30 item, paginatied list one would use:
   #   Resque.peek('my_list', 59, 30)
   def peek(queue, start = 0, count = 1)
-    result = queue(queue).slice(start, count)
-
-    if result.nil?
-      []
-    elsif result.respond_to?(:to_ary)
-      result.to_ary || [result]
-    else
-      [result]
-    end
+    list_range("queue:#{queue}", start, count)
   end
 
   # Does the dirty work of fetching a range of items from a Redis list
@@ -273,13 +186,14 @@ module Resque
 
   # Given a queue name, completely deletes the queue.
   def remove_queue(queue)
-    queue(queue).destroy
-    @queues.delete(queue.to_s)
+    redis.srem(:queues, queue.to_s)
+    redis.del("queue:#{queue}")
   end
 
-  # Return the Resque::Queue object for a given name
-  def queue(name)
-    @queues[name.to_s]
+  # Used internally to keep track of which queues we've created.
+  # Don't call this directly.
+  def watch_queue(queue)
+    redis.sadd(:queues, queue.to_s)
   end
 
 
@@ -317,7 +231,6 @@ module Resque
   #
   # This method is considered part of the `stable` API.
   def enqueue_to(queue, klass, *args)
-    validate(klass, queue)
     # Perform before_enqueue hooks. Don't perform enqueue if any hook returns false
     before_hooks = Plugin.before_enqueue_hooks(klass).collect do |hook|
       klass.send(hook, *args)
@@ -367,29 +280,11 @@ module Resque
     end
     return if before_hooks.any? { |result| result == false }
 
-    destroyed = Job.destroy(queue_from_class(klass), klass, *args)
+    Job.destroy(queue_from_class(klass), klass, *args)
 
     Plugin.after_dequeue_hooks(klass).each do |hook|
       klass.send(hook, *args)
     end
-    
-    destroyed
-  end
-
-  # This method will return an array of `Resque::Job` object in a queue.
-  # It assumes the class you're passing it is a real Ruby class (not
-  # a string or reference) which either:
-  #
-  #   a) has a @queue ivar set
-  #   b) responds to `queue`
-  #
-  # If either of those conditions are met, it will use the value obtained
-  # from performing one of the above operations to determine the queue.
-  #
-  # If no queue can be inferred this method will raise a `Resque::NoQueueError`
-
-  def queued(klass, *args)
-    Job.queued(queue_from_class(klass), klass, *args)
   end
 
   # Given a class, try to extrapolate an appropriate queue based on a
@@ -472,36 +367,5 @@ module Resque
       key.sub("#{redis.namespace}:", '')
     end
   end
-
-  private
-
-  # Register a new proc as a hook. If the block is nil this is the
-  # equivalent of removing all hooks of the given name.
-  #
-  # `name` is the hook that the block should be registered with.
-  def register_hook(name, block)
-    return clear_hooks(name) if block.nil?
-
-    @hooks ||= {}
-    @hooks[name] ||= []
-    @hooks[name] << block
-  end
-
-  # Clear all hooks given a hook name.
-  def clear_hooks(name)
-    @hooks && @hooks[name] = []
-  end
-
-  # Retrieve all hooks
-  def hooks
-    @hooks || {}
-  end
-
-  # Retrieve all hooks of a given name.
-  def hooks(name)
-    (@hooks && @hooks[name]) || []
-  end
 end
 
-# Log to STDOUT by default
-Resque.logger           = Logger.new(STDOUT)

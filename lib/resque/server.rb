@@ -14,7 +14,11 @@ module Resque
 
     set :views,  "#{dir}/server/views"
 
-    set :public_folder, "#{dir}/server/public"
+    if respond_to? :public_folder
+      set :public_folder, "#{dir}/server/public"
+    else
+      set :public, "#{dir}/server/public"
+    end
 
     set :static, true
 
@@ -24,10 +28,6 @@ module Resque
 
       def current_section
         url_path request.path_info.sub('/','').split('/')[0].downcase
-      end
-
-      def current_subtab
-        url_path request.path_info.sub('/','').split('/')[0, 2].join('/').downcase
       end
 
       def current_page
@@ -44,7 +44,7 @@ module Resque
       end
 
       def class_if_current(path = '')
-        'class="current"' if [current_section, current_subtab].include?(path)
+        'class="current"' if current_page[0, path.size] == path
       end
 
       def tab(name)
@@ -69,8 +69,6 @@ module Resque
           Resque.redis.get(key).length
         when 'zset'
           Resque.redis.zcard(key)
-        when 'hash'
-          Resque.redis.hlen(key)
         end
       end
 
@@ -86,8 +84,6 @@ module Resque
           [Resque.redis.get(key)]
         when 'zset'
           Resque.redis.zrange(key, start, start + 20)
-        when 'hash'
-          Resque.redis.hgetall(key)
         end
       end
 
@@ -192,14 +188,13 @@ module Resque
 
     post "/failed/requeue/all" do
       Resque::Failure.count.times do |num|
-        Resque::Failure.requeue_and_remove(0)
+        Resque::Failure.requeue(num)
       end
       redirect u('failed')
     end
 
     get "/failed/requeue/:index/?" do
-      Resque::Failure.requeue_and_remove(params[:index])
-
+      Resque::Failure.requeue(params[:index])
       if request.xhr?
         return Resque::Failure.all(params[:index])['retried_at']
       else

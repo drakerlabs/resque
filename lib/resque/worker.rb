@@ -1,5 +1,3 @@
-require 'time'
-
 module Resque
   # A Resque Worker processes jobs. On platforms that support fork(2),
   # the worker will fork off a child to process each job. This ensures
@@ -9,15 +7,18 @@ module Resque
   # It also ensures workers are always listening to signals from you,
   # their master, and can react accordingly.
   class Worker
-    extend  Resque::Helpers
     include Resque::Helpers
-    include Resque::Logging
+    extend Resque::Helpers
+
+    # Whether the worker should log basic info to STDOUT
+    attr_accessor :verbose
+
+    # Whether the worker should log lots of info to STDOUT
+    attr_accessor  :very_verbose
 
     # Boolean indicating whether this worker can or can not fork.
     # Automatically set if a fork(2) fails.
     attr_accessor :cant_fork
-
-    attr_accessor :term_timeout
 
     attr_writer :to_s
 
@@ -127,45 +128,37 @@ module Resque
       loop do
         break if shutdown?
 
-        pause if should_pause?
-
-        if job = reserve(interval)
-          Resque.logger.info "got: #{job.inspect}"
+        if not paused? and job = reserve
+          log "got: #{job.inspect}"
           job.worker = self
+          run_hook :before_fork, job
           working_on job
 
-          if @child = fork(job) do
-              unregister_signal_handlers
-              procline "Processing #{job.queue} since #{Time.now.to_i}"
-              reconnect
-              perform(job, &block)
-            end
+          if @child = fork
             srand # Reseeding
             procline "Forked #{@child} at #{Time.now.to_i}"
-            begin
-              Process.waitpid(@child)
-            rescue SystemCallError
-              nil
-            end
-            job.fail(DirtyExit.new($?.to_s)) if $?.signaled?
+            Process.wait(@child)
           else
             procline "Processing #{job.queue} since #{Time.now.to_i}"
-            reconnect
+            redis.client.reconnect # Don't share connection with parent
             perform(job, &block)
+            exit! unless @cant_fork
           end
+
           done_working
           @child = nil
         else
           break if interval.zero?
-          Resque.logger.debug "Timed out after #{interval} seconds"
+          log! "Sleeping for #{interval} seconds"
           procline paused? ? "Paused" : "Waiting for #{@queues.join(',')}"
+          sleep interval
         end
       end
 
+    ensure
       unregister_worker
-    rescue Exception => exception
-      unregister_worker(exception)
     end
+
     # DEPRECATED. Processes a single job. If none is given, it will
     # try to produce one. Usually run in the child.
     def process(job = nil, &block)
@@ -181,20 +174,18 @@ module Resque
     # Processes a given job in the child.
     def perform(job)
       begin
-        run_hook :after_fork, job if will_fork?
-        run_hook :before_perform, job
+        run_hook :after_fork, job
         job.perform
-        run_hook :after_perform, job
       rescue Object => e
-        Resque.logger.info "#{job.inspect} failed: #{e.inspect}"
+        log "#{job.inspect} failed: #{e.inspect}"
         begin
           job.fail(e)
         rescue Object => e
-          Resque.logger.info "Received exception when reporting failure: #{e.inspect}"
+          log "Received exception when reporting failure: #{e.inspect}"
         end
         failed!
       else
-        Resque.logger.info "done: #{job.inspect}"
+        log "done: #{job.inspect}"
       ensure
         yield job if block_given?
       end
@@ -202,66 +193,40 @@ module Resque
 
     # Attempts to grab a job off one of the provided queues. Returns
     # nil if no job can be found.
-    def reserve(interval = 5.0)
-      interval = interval.to_i
-      multi_queue = MultiQueue.new(
-        queues.map {|queue| Queue.new(queue, Resque.redis, Resque.coder) },
-        Resque.redis)
-
-      if interval < 1
-        begin
-          queue, job = multi_queue.pop(true)
-        rescue ThreadError
-          queue, job = nil
-        end
-      else
-        queue, job = multi_queue.poll(interval.to_i)
-      end
-
-      Resque.logger.debug "Found job on #{queue}"
-      Job.new(queue.name, job) if queue && job
-    end
-
-    # Reconnect to Redis to avoid sharing a connection with the parent,
-    # retry up to 3 times with increasing delay before giving up.
-    def reconnect
-      tries = 0
-      begin
-        redis.client.reconnect
-      rescue Redis::BaseConnectionError
-        if (tries += 1) <= 3
-          Resque.logger.info "Error reconnecting to Redis; retrying"
-          sleep(tries)
-          retry
-        else
-          Resque.logger.info "Error reconnecting to Redis; quitting"
-          raise
+    def reserve
+      queues.each do |queue|
+        log! "Checking #{queue}"
+        if job = Resque.reserve(queue)
+          log! "Found job on #{queue}"
+          return job
         end
       end
+
+      nil
+    rescue Exception => e
+      log "Error reserving job: #{e.inspect}"
+      log e.backtrace.join("\n")
+      raise e
     end
 
     # Returns a list of queues to use when searching for a job.
     # A splat ("*") means you want every queue (in alpha order) - this
-    # can be useful for dynamically adding new queues. Low priority queues
-    # can be placed after a splat to ensure execution after all other dynamic
-    # queues.
+    # can be useful for dynamically adding new queues.
     def queues
-      @queues.map {|queue| queue == "*" ? (Resque.queues - @queues).sort : queue }.flatten.uniq
+      @queues.map {|queue| queue == "*" ? Resque.queues.sort : queue }.flatten.uniq
     end
 
     # Not every platform supports fork. Here we do our magic to
     # determine if yours does.
-    def fork(job,&block)
+    def fork
+      @cant_fork = true if $TESTING
+
       return if @cant_fork
-      
-      # Only run before_fork hooks if we're actually going to fork
-      # (after checking @cant_fork)
-      run_hook :before_fork, job if will_fork?
 
       begin
         # IronRuby doesn't support `Kernel.fork` yet
         if Kernel.respond_to?(:fork)
-          Kernel.fork &block if will_fork?
+          Kernel.fork
         else
           raise NotImplementedError
         end
@@ -276,7 +241,7 @@ module Resque
       enable_gc_optimizations
       register_signal_handlers
       prune_dead_workers
-      run_hook :before_first_fork, self
+      run_hook :before_first_fork
       register_worker
 
       # Fix buffering so we can `rake resque:work > resque.log` and
@@ -308,29 +273,18 @@ module Resque
         trap('QUIT') { shutdown   }
         trap('USR1') { kill_child }
         trap('USR2') { pause_processing }
+        trap('CONT') { unpause_processing }
       rescue ArgumentError
         warn "Signals QUIT, USR1, USR2, and/or CONT not supported."
       end
 
-      Resque.logger.debug "Registered signals"
-    end
-
-    def unregister_signal_handlers
-      trap('TERM') { raise TermException.new("SIGTERM") }
-      trap('INT', 'DEFAULT')
-
-      begin
-        trap('QUIT', 'DEFAULT')
-        trap('USR1', 'DEFAULT')
-        trap('USR2', 'DEFAULT')
-      rescue ArgumentError
-      end
+      log! "Registered signals"
     end
 
     # Schedule this worker for shutdown. Will finish processing the
     # current job.
     def shutdown
-      Resque.logger.info 'Exiting...'
+      log 'Exiting...'
       @shutdown = true
     end
 
@@ -345,53 +299,36 @@ module Resque
       @shutdown
     end
 
-    # Kills the forked child immediately with minimal remorse. The job it
-    # is processing will not be completed. Send the child a TERM signal,
-    # wait 5 seconds, and then a KILL signal if it has not quit
+    # Kills the forked child immediately, without remorse. The job it
+    # is processing will not be completed.
     def kill_child
       if @child
-        unless Process.waitpid(@child, Process::WNOHANG)
-          Resque.logger.debug "Sending TERM signal to child #{@child}"
-          Process.kill("TERM", @child)
-          (term_timeout.to_f * 10).round.times do |i|
-            sleep(0.1)
-            return if Process.waitpid(@child, Process::WNOHANG)
-          end
-          Resque.logger.debug "Sending KILL signal to child #{@child}"
-          Process.kill("KILL", @child)
+        log! "Killing child at #{@child}"
+        if system("ps -o pid,state -p #{@child}")
+          Process.kill("KILL", @child) rescue nil
         else
-          Resque.logger.debug "Child #{@child} already quit."
+          log! "Child #{@child} not found, restarting."
+          shutdown
         end
       end
-    rescue SystemCallError
-      Resque.logger.debug "Child #{@child} already quit and reaped."
     end
 
     # are we paused?
-    def should_pause?
+    def paused?
       @paused
-    end
-    alias :paused? :should_pause?
-
-    def pause
-      rd, wr = IO.pipe
-      trap('CONT') {
-        Resque.logger.info "CONT received; resuming job processing"
-        @paused = false
-        wr.write 'x'
-        wr.close
-      }
-      run_hook :before_pause, self
-      rd.read 1
-      rd.close
-      run_hook :after_pause, self
     end
 
     # Stop processing jobs after the current one has completed (if we're
     # currently running one).
     def pause_processing
-      Resque.logger.info "USR2 received; pausing job processing"
+      log "USR2 received; pausing job processing"
       @paused = true
+    end
+
+    # Start processing jobs again after a pause
+    def unpause_processing
+      log "CONT received; resuming job processing"
+      @paused = false
     end
 
     # Looks for any workers which should be running on this server
@@ -411,7 +348,7 @@ module Resque
         host, pid, queues = worker.id.split(':')
         next unless host == hostname
         next if known_workers.include?(pid)
-        Resque.logger.debug "Pruning dead worker: #{worker}"
+        log! "Pruning dead worker: #{worker}"
         worker.unregister_worker
       end
     end
@@ -425,18 +362,16 @@ module Resque
 
     # Runs a named hook, passing along any arguments.
     def run_hook(name, *args)
-      return unless hooks = Resque.send(name)
-      msg = "Running #{name} hooks"
+      return unless hook = Resque.send(name)
+      msg = "Running #{name} hook"
       msg << " with #{args.inspect}" if args.any?
-      Resque.logger.info msg
+      log msg
 
-      hooks.each do |hook|
-        args.any? ? hook.call(*args) : hook.call
-      end
+      args.any? ? hook.call(*args) : hook.call
     end
 
     # Unregisters ourself as a worker. Useful when shutting down.
-    def unregister_worker(exception = nil)
+    def unregister_worker
       # If we're still processing a job, make sure it gets logged as a
       # failure.
       if (hash = processing) && !hash.empty?
@@ -444,7 +379,7 @@ module Resque
         # Ensure the proper worker is attached to this job, even if
         # it's not the precise instance that died.
         job.worker = self
-        job.fail(exception || DirtyExit.new)
+        job.fail(DirtyExit.new)
       end
 
       redis.srem(:workers, self)
@@ -460,7 +395,7 @@ module Resque
     def working_on(job)
       data = encode \
         :queue   => job.queue,
-        :run_at  => Time.now.utc.iso8601,
+        :run_at  => Time.now.strftime("%Y/%m/%d %H:%M:%S %Z"),
         :payload => job.payload
       redis.set("worker:#{self}", data)
     end
@@ -501,7 +436,7 @@ module Resque
 
     # Tell Redis we've started
     def started!
-      redis.set("worker:#{self}:started", Time.now.rfc2822)
+      redis.set("worker:#{self}:started", Time.now.to_s)
     end
 
     # Returns a hash explaining the Job we're currently processing, if any.
@@ -518,10 +453,6 @@ module Resque
     # Boolean - true if idle, false if not
     def idle?
       state == :idle
-    end
-    
-    def will_fork?
-      !(@cant_fork || $TESTING)
     end
 
     # Returns a symbol representing the current worker state,
@@ -546,8 +477,9 @@ module Resque
     end
     alias_method :id, :to_s
 
+    # chomp'd hostname of this machine
     def hostname
-      Socket.gethostname
+      @hostname ||= `hostname`.chomp
     end
 
     # Returns Integer PID of running worker
@@ -560,47 +492,33 @@ module Resque
     def worker_pids
       if RUBY_PLATFORM =~ /solaris/
         solaris_worker_pids
-      elsif RUBY_PLATFORM =~ /mingw32/
-        windows_worker_pids
       else
         linux_worker_pids
       end
     end
 
-    # Find Resque worker pids on Windows.
+    # Find Resque worker pids on Linux and OS X.
     #
     # Returns an Array of string pids of all the other workers on this
     # machine. Useful when pruning dead workers on startup.
-    def windows_worker_pids
-      `tasklist  /FI "IMAGENAME eq ruby.exe" /FO list`.split($/).select { |line| line =~ /^PID:/}.collect{ |line| line.gsub /PID:\s+/, '' }
-    end
-
-    # Find Resque worker pids on Linux and OS X.
-    #
     def linux_worker_pids
-      get_worker_pids('ps -A -o pid,command')
+      `ps -A -o pid,command | grep "[r]esque" | grep -v "resque-web"`.split("\n").map do |line|
+        line.split(' ')[0]
+      end
     end
 
     # Find Resque worker pids on Solaris.
     #
-    def solaris_worker_pids
-      get_worker_pids('ps -A -o pid,args')
-    end
-
-    # Find worker pids - platform independent
-    #
     # Returns an Array of string pids of all the other workers on this
     # machine. Useful when pruning dead workers on startup.
-    def get_worker_pids(command)
-       active_worker_pids = []
-       output = %x[#{command}]  # output format of ps must be ^<PID> <COMMAND WITH ARGS>
-       raise 'System call for ps command failed. Please make sure that you have a compatible ps command in the path!' unless $?.success?
-       output.split($/).each{|line|
-        next unless line =~ /resque/i
-        next if line =~ /resque-web/
-        active_worker_pids.push line.split(' ')[0]
-       }
-       active_worker_pids
+    def solaris_worker_pids
+      `ps -A -o pid,comm | grep "[r]uby" | grep -v "resque-web"`.split("\n").map do |line|
+        real_pid = line.split(' ')[0]
+        pargs_command = `pargs -a #{real_pid} 2>/dev/null | grep [r]esque | grep -v "resque-web"`
+        if pargs_command.split(':')[1] == " resque-#{Resque::Version}"
+          real_pid
+        end
+      end.compact
     end
 
     # Given a string, sets the procline ($0) and logs.
@@ -608,7 +526,22 @@ module Resque
     #   resque-VERSION: STRING
     def procline(string)
       $0 = "resque-#{Resque::Version}: #{string}"
-      Resque.logger.debug $0
+      log! $0
+    end
+
+    # Log a message to STDOUT if we are verbose or very_verbose.
+    def log(message)
+      if verbose
+        puts "*** #{message}"
+      elsif very_verbose
+        time = Time.now.strftime('%H:%M:%S %Y-%m-%d')
+        puts "** [#{time}] #$$: #{message}"
+      end
+    end
+
+    # Logs a very verbose message to STDOUT.
+    def log!(message)
+      log message if very_verbose
     end
   end
 end

@@ -1,14 +1,18 @@
 require 'rubygems'
-require 'timeout'
-require 'bundler/setup'
-require 'redis/namespace'
-require 'minitest/autorun'
 
-$dir = File.dirname(File.expand_path(__FILE__))
-$LOAD_PATH.unshift $dir + '/../lib'
-require 'resque'
+dir = File.dirname(File.expand_path(__FILE__))
+$LOAD_PATH.unshift dir + '/../lib'
 $TESTING = true
-$TEST_PID=Process.pid
+require 'test/unit'
+
+require 'redis/namespace'
+require 'resque'
+
+begin
+  require 'leftright'
+rescue LoadError
+end
+
 
 #
 # make sure we can run redis
@@ -26,41 +30,57 @@ end
 # kill it when they end
 #
 
-MiniTest::Unit.after_tests do
-  if Process.pid == $TEST_PID
-    processes = `ps -A -o pid,command | grep [r]edis-test`.split($/)
-    pids = processes.map { |process| process.split(" ")[0] }
-    puts "Killing test redis server..."
-    pids.each { |pid| Process.kill("TERM", pid.to_i) }
-    system("rm -f #{$dir}/dump.rdb #{$dir}/dump-cluster.rdb")
+at_exit do
+  next if $!
+
+  if defined?(MiniTest)
+    exit_code = MiniTest::Unit.new.run(ARGV)
+  else
+    exit_code = Test::Unit::AutoRunner.run
   end
+
+  processes = `ps -A -o pid,command | grep [r]edis-test`.split("\n")
+  pids = processes.map { |process| process.split(" ")[0] }
+  puts "Killing test redis server..."
+  `rm -f #{dir}/dump.rdb #{dir}/dump-cluster.rdb`
+  pids.each { |pid| Process.kill("KILL", pid.to_i) }
+  exit exit_code
 end
 
 if ENV.key? 'RESQUE_DISTRIBUTED'
   require 'redis/distributed'
   puts "Starting redis for testing at localhost:9736 and localhost:9737..."
-  `redis-server #{$dir}/redis-test.conf`
-  `redis-server #{$dir}/redis-test-cluster.conf`
+  `redis-server #{dir}/redis-test.conf`
+  `redis-server #{dir}/redis-test-cluster.conf`
   r = Redis::Distributed.new(['redis://localhost:9736', 'redis://localhost:9737'])
   Resque.redis = Redis::Namespace.new :resque, :redis => r
 else
   puts "Starting redis for testing at localhost:9736..."
-  `redis-server #{$dir}/redis-test.conf`
+  `redis-server #{dir}/redis-test.conf`
   Resque.redis = 'localhost:9736'
 end
 
-class DummyLogger
-  attr_reader :messages
 
-  def initialize
-    @messages = []
+##
+# test/spec/mini 3
+# http://gist.github.com/25455
+# chris@ozmm.org
+#
+def context(*args, &block)
+  return super unless (name = args.first) && block
+  require 'test/unit'
+  klass = Class.new(defined?(ActiveSupport::TestCase) ? ActiveSupport::TestCase : Test::Unit::TestCase) do
+    def self.test(name, &block)
+      define_method("test_#{name.gsub(/\W/,'_')}", &block) if block
+    end
+    def self.xtest(*args) end
+    def self.setup(&block) define_method(:setup, &block) end
+    def self.teardown(&block) define_method(:teardown, &block) end
   end
-
-  def info(message); @messages << message; end
-  alias_method :debug, :info
-  alias_method :warn,  :info
-  alias_method :error, :info
-  alias_method :fatal, :info
+  (class << klass; self end).send(:define_method, :name) { name.gsub(/\W/,'_') }
+  klass.class_eval &block
+  # XXX: In 1.8.x, not all tests will run unless anonymous classes are kept in scope.
+  ($test_classes ||= []) << klass
 end
 
 ##
@@ -86,13 +106,6 @@ class SomeIvarJob < SomeJob
   @queue = :ivar
 end
 
-class NestedJob
-  @queue = :nested
-  def self.perform
-    Resque.enqueue(SomeIvarJob, 20, '/tmp')
-  end
-end
-
 class SomeMethodJob < SomeJob
   def self.queue
     :method
@@ -111,15 +124,6 @@ class GoodJob
   end
 end
 
-class AtExitJob
-  def self.perform(filename)
-    at_exit do
-      File.open(filename, "w") {|file| file.puts "at_exit"}
-    end
-    "at_exit job"
-  end
-end
-
 class BadJobWithSyntaxError
   def self.perform
     raise SyntaxError, "Extra Bad job!"
@@ -132,12 +136,6 @@ class BadFailureBackend < Resque::Failure::Base
   end
 end
 
-class JobWithNoQueue
-  def self.perform
-    "I don't have a queue."
-  end
-end
-
 def with_failure_backend(failure_backend, &block)
   previous_backend = Resque::Failure.backend
   Resque::Failure.backend = failure_backend
@@ -145,8 +143,6 @@ def with_failure_backend(failure_backend, &block)
 ensure
   Resque::Failure.backend = previous_backend
 end
-
-require 'time'
 
 class Time
   # Thanks, Timecop
@@ -162,11 +158,3 @@ class Time
 
   self.fake_time = nil
 end
-
-# Log to log/test.log
-def reset_logger
-  $test_logger ||= Logger.new(File.open(File.expand_path("../../log/test.log", __FILE__), "w"))
-  Resque.logger = $test_logger
-end
-
-reset_logger

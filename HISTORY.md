@@ -1,26 +1,3 @@
-## 1.24.0.pre (YYYY-MM-DD)
-
-* Optional RedisMultiQueue failure backend, can be enabled with
-  FAILURE_BACKEND=redis_multi_queue env var (@tarcieri)
-* resque:failures:sort rake task will migrate an existing "failed" queue into
-  separate failure queues per job queue, allowing an easy migration to
-  the RedisMultiQueue failure backend (@tarcieri)
-* Disable forking completely with FORK_PER_JOB=false env var (@tarcieri)
-* Report a failure when processes are killed with signals (@dylanahsmith)
-
-## 1.23.0 (2012-10-01)
-
-* don't run `before_fork` hook if Resque can't fork (@kjwierenga, @tarcieri, #672, #697)
-* don't run `after_fork` hook if Resque can't fork (@kjwierenga, @tarcieri, #672, #697)
-* retry connecting to redis up to 3 times (@trevorturk, #693)
-* pass exceptions raised by the worker into the Failure backend (@trevorturk, #693)
-
-## 1.22.0 (2012-08-21)
-
-* unregister signal handlers in child process when ENV["TERM_CHILD"] is set (@dylanasmith, #621)
-* new signal handling for TERM. See http://hone.heroku.com/resque/2012/08/21/resque-signals.html. (@wuputah, @yaaule, #638)
-* supports calling perform hooks when using Resque.inline (@jonhyman, #506)
-
 ## 1.21.0 (2012-07-02)
 
 * Add a flag to make sure failure hooks are only ran once (jakemack, #546)

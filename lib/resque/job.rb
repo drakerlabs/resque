@@ -44,11 +44,9 @@ module Resque
       Resque.validate(klass, queue)
 
       if Resque.inline?
-        # Instantiating a Resque::Job and calling perform on it so callbacks run
-        # decode(encode(args)) to ensure that args are normalized in the same manner as a non-inline job
-        new(:inline, {'class' => klass, 'args' => decode(encode(args))}).perform
+        constantize(klass).perform(*decode(encode(args)))
       else
-        Resque.push(queue, 'class' => klass.to_s, 'args' => args)
+        Resque.push(queue, :class => klass.to_s, :args => args)
       end
     end
 
@@ -88,47 +86,10 @@ module Resque
           end
         end
       else
-        destroyed += redis.lrem(queue, 0, encode('class' => klass, 'args' => args))
+        destroyed += redis.lrem(queue, 0, encode(:class => klass, :args => args))
       end
 
       destroyed
-    end
-
-    # Find jobs from a queue. Expects a string queue name, a
-    # string class name, and, optionally, args.
-    #
-    # Returns the list of jobs queued.
-    #
-    # If no args are provided, it will return all jobs of the class
-    # provided.
-    #
-    # That is, for these two jobs:
-    #
-    # { 'class' => 'UpdateGraph', 'args' => ['defunkt'] }
-    # { 'class' => 'UpdateGraph', 'args' => ['mojombo'] }
-    #
-    # The following call will find both:
-    #
-    #   Resque::Job.queued(queue, 'UpdateGraph')
-    #
-    # Whereas specifying args will only find the 2nd job:
-    #
-    #   Resque::Job.queued(queue, 'UpdateGraph', 'mojombo')
-    #
-    # This method can be potentially very slow and memory intensive,
-    # depending on the size of your queue, as it loads all jobs into
-    # a Ruby array.
-    def self.queued(queue, klass, *args)
-      klass = klass.to_s
-
-      redis.lrange("queue:#{queue}", 0, -1).inject([]) do |memo, string|
-        decoded = decode(string)
-        if decoded['class'] == klass && (args.empty? || decoded['args'] == args)
-          memo << new(queue, decoded)
-        end
-
-        memo
-      end
     end
 
     # Given a string queue name, returns an instance of Resque::Job
@@ -148,7 +109,7 @@ module Resque
 
       begin
         # Execute before_perform hook. Abort the job gracefully if
-        # Resque::Job::DontPerform is raised.
+        # Resque::DontPerform is raised.
         begin
           before_hooks.each do |hook|
             job.send(hook, *job_args)
@@ -203,13 +164,6 @@ module Resque
       @payload_class ||= constantize(@payload['class'])
     end
 
-    # returns true if payload_class does not raise NameError
-    def has_payload_class?
-      payload_class != Object
-    rescue NameError
-      false
-    end
-
     # Returns an array of args represented in this job's payload.
     def args
       @payload['args']
@@ -218,7 +172,7 @@ module Resque
     # Given an exception object, hands off the needed parameters to
     # the Failure module.
     def fail(exception)
-      run_failure_hooks(exception) if has_payload_class?
+      run_failure_hooks(exception)
       Failure.create \
         :payload   => payload,
         :exception => exception,
@@ -265,7 +219,6 @@ module Resque
       begin
         job_args = args || []
         failure_hooks.each { |hook| payload_class.send(hook, exception, *job_args) } unless @failure_hooks_ran
-      rescue
       ensure
         @failure_hooks_ran = true
       end
